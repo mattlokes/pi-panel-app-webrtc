@@ -11,13 +11,26 @@ server = "http://frigate.home.local:1984"
 keep_connected = false
 linger_seconds = 30
 
+# How the connection is negotiated with go2rtc (per camera, too):
+#   "websocket"  go2rtc's /api/ws: go2rtc answers at once and sends its network
+#                addresses as it finds them. The default.
+#   "http"       go2rtc's POST /api/webrtc (WHEP style): go2rtc answers only
+#                after gathering its own addresses, including from its STUN
+#                server. If that server is unreachable (a LAN-only Frigate), each
+#                connection waits for the STUN timeout, about 8 seconds.
+# whep_url cameras always use "http".
+signalling = "websocket"
+
 # The first camera is shown at start. Switch with the camera_<name> actions,
 # next/previous, or io.pipanel.app.WebRTC.SelectCamera.
 [[camera]]
 name = "front_door"            # lowercase, digits, '-' or '_': used in action names
 label = "Front door"
-src = "front_door_sub"         # go2rtc stream name. The _sub stream decodes far
-                               # cheaper; the Pi 5 has no H.264 hardware decoder.
+src = "front_door"             # go2rtc stream name. The Pi 5 has no H.264 hardware
+                               # decoder: a 2560x1920 main stream costs about half a
+                               # core, a 640x480 sub stream (e.g. "front_door_sub")
+                               # about 6%, but looks soft full screen.
+# signalling = "http"          # per-camera override
 
 # Any other WHEP server (e.g. MediaMTX) instead of go2rtc:
 # [[camera]]

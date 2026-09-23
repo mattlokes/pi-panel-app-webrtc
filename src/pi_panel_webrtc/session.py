@@ -7,9 +7,15 @@ The decoded frames go to the always-running display pipeline through an
 intervideo channel, so the window stays mapped however often this session is
 torn down and rebuilt.
 
-Signalling is non-trickle, WHEP style: create the offer, set it locally,
-wait for ICE gathering to complete, POST it (on a worker thread), then set
-the answer.
+Signalling: create the offer, set it locally, wait for our ICE gathering to
+complete (about 0.35s), then, on a worker thread, per `camera.signalling`:
+
+- "websocket": open go2rtc's /api/ws, send the offer, and apply the answer and
+  the candidates go2rtc trickles after it. The socket stays open for the whole
+  session, because go2rtc stops the stream when it closes.
+- "http": POST the offer (go2rtc's /api/webrtc, or any WHEP endpoint) and set
+  the answer. The server answers only after its own ICE gathering; on a
+  LAN-only go2rtc with the default STUN server that is 7.8s.
 
 Hard-won details:
 - webrtcbin signals arrive on its own threads. Every handler here only
@@ -41,7 +47,7 @@ gi.require_version("GstWebRTC", "1.0")
 from gi.repository import GLib, Gst, GstSdp, GstWebRTC  # noqa: E402
 
 from .config import Camera  # noqa: E402
-from .signalling import SignallingError, post_offer  # noqa: E402
+from .signalling import Go2rtcSocket, SignallingError, post_offer  # noqa: E402
 
 log = logging.getLogger("pi-panel-webrtc")
 
@@ -68,6 +74,7 @@ class CameraSession:
     def __init__(self, camera: Camera, server: str, channel: str,
                  on_change: Callable[[], None]) -> None:
         self.camera = camera
+        self.server = server
         self.url = camera.offer_url(server)
         self.channel = channel
         self.on_change = on_change
@@ -76,6 +83,10 @@ class CameraSession:
         self._pipeline: Gst.Pipeline | None = None
         self._webrtc: Gst.Element | None = None
         self._keep: list[Any] = []          # descriptions webrtcbin still needs
+        self._socket: Go2rtcSocket | None = None
+        self._socket_lock = threading.Lock()   # the worker hands the socket over under it
+        self._remote_set = False
+        self._early_candidates: list[str] = []  # trickled before the answer was applied
         self._timers: list[int] = []
         self._backoff = BACKOFF_MIN
         self._posted = False
@@ -159,6 +170,14 @@ class CameraSession:
             self._pipeline = None
         self._webrtc = None
         self._keep.clear()
+        with self._socket_lock:
+            if self._socket is not None:
+                # Also ends the worker thread blocked in recv(); its generation
+                # is stale by now, so it reports nothing.
+                self._socket.close()
+                self._socket = None
+        self._remote_set = False
+        self._early_candidates.clear()
 
     def _retry(self, reason: str) -> None:
         log.warning("%s: %s", self.camera.name, reason)
@@ -222,12 +241,25 @@ class CameraSession:
             return
         self._on_main(self._post_offer)
 
+    def _from_thread(self, gen: int, fn: Callable[..., Any], *args: Any) -> None:
+        """From a worker thread: run fn on the GLib loop if |gen| is still current."""
+        def run() -> bool:
+            if gen == self._gen:
+                fn(*args)
+            return False
+        GLib.idle_add(run)
+
     def _post_offer(self) -> None:
         if self._posted or self._webrtc is None:
             return
         self._posted = True
         sdp = self._webrtc.get_property("local-description").sdp.as_text()
         gen = self._gen
+
+        if self.camera.signalling == "websocket":
+            threading.Thread(target=self._websocket_worker, args=(gen, sdp),
+                             name="webrtc-go2rtc-ws", daemon=True).start()
+            return
 
         def worker() -> None:
             try:
@@ -239,6 +271,43 @@ class CameraSession:
             GLib.idle_add(lambda: gen == self._gen and self._apply_answer(answer) and False)
 
         threading.Thread(target=worker, name="webrtc-signalling", daemon=True).start()
+
+    def _websocket_worker(self, gen: int, sdp: str) -> None:
+        try:
+            sock = Go2rtcSocket.open(self.server, self.camera.src or "")
+        except SignallingError as exc:
+            self._from_thread(gen, self._retry, str(exc))
+            return
+        # Hand the socket over synchronously: if the session has already moved
+        # on, close it here, or nothing would, and go2rtc would keep streaming
+        # to a thread blocked in recv() forever.
+        with self._socket_lock:
+            if gen != self._gen:
+                sock.close()
+                return
+            self._socket = sock
+        try:
+            sock.send_offer(sdp)
+            for kind, value in sock.messages():
+                if gen != self._gen:
+                    break
+                if kind == "answer":
+                    self._from_thread(gen, self._apply_answer, value)
+                elif kind == "candidate":
+                    self._from_thread(gen, self._add_candidate, value)
+                elif kind == "error":
+                    self._from_thread(gen, self._retry, f"go2rtc: {value}")
+                    break
+        except SignallingError as exc:
+            self._from_thread(gen, self._retry, str(exc))
+
+    def _add_candidate(self, candidate: str) -> None:
+        if self._webrtc is None:
+            return
+        if not self._remote_set:
+            self._early_candidates.append(candidate)
+            return
+        self._webrtc.emit("add-ice-candidate", 0, candidate)
 
     def _apply_answer(self, text: str) -> None:
         result, sdp = GstSdp.SDPMessage.new_from_text(text)
@@ -252,6 +321,10 @@ class CameraSession:
         answer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.ANSWER, sdp)
         self._keep.append(answer)
         self._webrtc.emit("set-remote-description", answer, None)
+        self._remote_set = True
+        for candidate in self._early_candidates:
+            self._webrtc.emit("add-ice-candidate", 0, candidate)
+        self._early_candidates.clear()
 
     def _on_connection_state(self, webrtc: Gst.Element, _pspec: Any) -> None:
         state = webrtc.get_property("connection-state")

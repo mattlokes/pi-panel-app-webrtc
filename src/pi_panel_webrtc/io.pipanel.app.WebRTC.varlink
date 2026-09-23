@@ -8,7 +8,9 @@ type Camera (
   name: string,
   label: string,
   # "go2rtc:<stream>" or a WHEP URL
-  source: string
+  source: string,
+  # how the offer is exchanged: go2rtc's WebSocket API, or HTTP (WHEP style)
+  signalling: (websocket, http)
 )
 
 method ListCameras() -> (cameras: []Camera, current: string)

@@ -60,7 +60,8 @@ def on_main(fn, *args) -> None:
 
 
 def camera_list(controller: Controller) -> dict:
-    return {"cameras": [{"name": c.name, "label": c.label, "source": c.source}
+    return {"cameras": [{"name": c.name, "label": c.label, "source": c.source,
+                         "signalling": c.signalling}
                         for c in controller.config.cameras],
             "current": controller.camera.name}
 

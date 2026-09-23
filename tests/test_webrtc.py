@@ -29,7 +29,7 @@ def test_shipped_example_is_valid():
     assert cfg.server == "http://frigate.home.local:1984"
     assert [c.name for c in cfg.cameras] == ["front_door"]
     assert cfg.cameras[0].offer_url(cfg.server) == \
-        "http://frigate.home.local:1984/api/webrtc?src=front_door_sub"
+        "http://frigate.home.local:1984/api/webrtc?src=front_door"
 
 
 def test_whep_camera_needs_no_server():
@@ -264,3 +264,177 @@ def test_reload_keeps_the_selected_camera_or_falls_back():
     assert ctl.camera.name == "back" and log[-1] == ("start", "back")   # same camera, kept
     ctl.reconfigure(cfg(camera=[{"name": "side", "src": "s"}]))          # "back" removed
     assert ctl.camera.name == "side" and log[-2:] == [("stop", "back"), ("start", "side")]
+
+
+# --- WebSocket client and go2rtc's WebSocket API ------------------------------------
+
+import base64 as _b64
+import hashlib as _hashlib
+import json as _json
+import socketserver as _ss
+import struct as _struct
+
+from pi_panel_webrtc.signalling import Go2rtcSocket
+from pi_panel_webrtc.wsclient import WebSocket, WebSocketClosed, WebSocketError
+
+
+def _frame(opcode, payload=b"", fin=True):
+    n = len(payload)
+    head = bytes([(0x80 if fin else 0) | opcode])
+    head += bytes([n]) if n < 126 else bytes([126]) + _struct.pack("!H", n)
+    return head + payload
+
+
+class _WSHandler(_ss.StreamRequestHandler):
+    """A tiny WebSocket server: behaviour picked by the request path."""
+
+    def read_frame(self):
+        b1, b2 = self.rfile.read(2)
+        n = b2 & 0x7F
+        if n == 126:
+            n = _struct.unpack("!H", self.rfile.read(2))[0]
+        mask = self.rfile.read(4)
+        data = bytes(b ^ mask[i % 4] for i, b in enumerate(self.rfile.read(n)))
+        return b1 & 0x0F, data
+
+    def handle(self):
+        request = self.rfile.readline().decode()
+        path = request.split()[1]
+        headers = {}
+        while (line := self.rfile.readline().decode().strip()):
+            k, _, v = line.partition(":")
+            headers[k.strip().lower()] = v.strip()
+        accept = _b64.b64encode(_hashlib.sha1(
+            (headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        if path == "/badaccept":
+            accept = "nonsense"
+        if path == "/refuse":
+            self.wfile.write(b"HTTP/1.1 404 Not Found\r\n\r\n")
+            return
+        self.wfile.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                          f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").encode())
+        w = self.wfile.write
+        if path == "/echo":
+            op, data = self.read_frame()
+            w(_frame(0x1, data))
+            self.read_frame()                                    # the client's close
+        elif path == "/frag":
+            w(_frame(0x1, b"hel", fin=False) + _frame(0x0, b"lo", fin=True))
+        elif path == "/ping":
+            w(_frame(0x9, b"hb"))
+            op, data = self.read_frame()
+            w(_frame(0x1, f"got {op:x} {data.decode()}".encode()))
+        elif path == "/close":
+            w(_frame(0x8, _struct.pack("!H", 1001)))
+        elif path.startswith("/api/ws?src="):
+            src = path.split("=", 1)[1]
+            op, data = self.read_frame()
+            offer = _json.loads(data)
+            assert offer["type"] == "webrtc/offer" and offer["value"].startswith("v=0")
+            if src == "missing":
+                w(_frame(0x1, _json.dumps({"type": "error", "value": "streams: stream not found"}).encode()))
+            else:
+                for msg in ({"type": "webrtc/answer", "value": "v=0 answer"},
+                            {"type": "webrtc/candidate", "value": "candidate:1 1 udp 1 192.168.4.97 8555 typ host"},
+                            {"type": "webrtc/candidate", "value": ""},       # end-of-candidates: ignored
+                            {"type": "stats", "value": "?"}):                # not for us: ignored
+                    w(_frame(0x1, _json.dumps(msg).encode()))
+            w(_frame(0x8, _struct.pack("!H", 1000)))
+
+
+@pytest.fixture
+def ws_server():
+    server = _ss.ThreadingTCPServer(("127.0.0.1", 0), _WSHandler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+    server.server_close()
+
+
+def test_ws_echo(ws_server):
+    ws = WebSocket.connect(f"ws://{ws_server}/echo")
+    ws.send_text("hello " * 30)          # > 125 bytes: 16-bit length
+    assert ws.recv() == "hello " * 30
+    ws.close()
+
+
+def test_ws_fragments_and_close(ws_server):
+    ws = WebSocket.connect(f"ws://{ws_server}/frag")
+    assert ws.recv() == "hello"
+    ws2 = WebSocket.connect(f"ws://{ws_server}/close")
+    with pytest.raises(WebSocketClosed, match="1001"):
+        ws2.recv()
+
+
+def test_ws_answers_pings(ws_server):
+    ws = WebSocket.connect(f"ws://{ws_server}/ping")
+    assert ws.recv() == "got a hb"       # the server received our pong (0xA) with its payload
+
+
+def test_ws_handshake_failures(ws_server):
+    with pytest.raises(WebSocketError, match="Sec-WebSocket-Accept"):
+        WebSocket.connect(f"ws://{ws_server}/badaccept")
+    with pytest.raises(WebSocketError, match="refused"):
+        WebSocket.connect(f"ws://{ws_server}/refuse")
+    with pytest.raises(WebSocketError, match="cannot connect"):
+        WebSocket.connect("ws://127.0.0.1:9/x", timeout=2)
+    with pytest.raises(WebSocketError, match="not a ws"):
+        WebSocket.connect("http://example.invalid/")
+
+
+def test_go2rtc_socket_url():
+    assert Go2rtcSocket.url("http://frigate.home.local:1984", "front_door") == \
+        "ws://frigate.home.local:1984/api/ws?src=front_door"
+    assert Go2rtcSocket.url("https://h/go2rtc/", "a b") == "wss://h/go2rtc/api/ws?src=a%20b"
+    with pytest.raises(SignallingError):
+        Go2rtcSocket.url("ftp://h", "x")
+
+
+def test_go2rtc_socket_messages(ws_server):
+    sock = Go2rtcSocket.open(f"http://{ws_server}", "front_door")
+    sock.send_offer("v=0 offer")
+    got = []
+    with pytest.raises(SignallingError, match="connection lost"):
+        for kind, value in sock.messages():
+            got.append((kind, value))
+    assert got == [("answer", "v=0 answer"),
+                   ("candidate", "candidate:1 1 udp 1 192.168.4.97 8555 typ host")]
+
+
+def test_go2rtc_socket_error_message(ws_server):
+    sock = Go2rtcSocket.open(f"http://{ws_server}", "missing")
+    sock.send_offer("v=0 offer")
+    assert next(iter(sock.messages())) == ("error", "streams: stream not found")
+    sock.close()
+
+
+# --- the signalling option -------------------------------------------------------------
+
+def test_signalling_defaults_and_overrides():
+    c = Config.from_dict({"server": "http://x", "camera": [
+        {"name": "a", "src": "a"},
+        {"name": "b", "src": "b", "signalling": "http"},
+        {"name": "c", "whep_url": "http://m/c/whep"}]})
+    assert [x.signalling for x in c.cameras] == ["websocket", "http", "http"]
+    c = Config.from_dict({"server": "http://x", "signalling": "http", "camera": [
+        {"name": "a", "src": "a"}, {"name": "b", "src": "b", "signalling": "websocket"}]})
+    assert [x.signalling for x in c.cameras] == ["http", "websocket"]
+
+
+@pytest.mark.parametrize("data,msg", [
+    ({"server": "http://x", "signalling": "carrier-pigeon", "camera": [{"name": "a", "src": "a"}]}, "signalling"),
+    ({"server": "http://x", "camera": [{"name": "a", "src": "a", "signalling": "grpc"}]}, "signalling"),
+    ({"camera": [{"name": "a", "whep_url": "http://m/whep", "signalling": "websocket"}]}, "whep_url"),
+])
+def test_signalling_rejects(data, msg):
+    with pytest.raises(ConfigError, match=msg):
+        Config.from_dict(data)
+
+
+def test_reload_changing_signalling_reconnects():
+    ctl, log, _ = make(cameras=("front", "back"))
+    ctl.config = cfg()
+    ctl.set_visible(True)
+    ctl.reconfigure(cfg(camera=[{"name": "front", "src": "front_sub", "signalling": "http"}]))
+    assert log[-2:] == [("stop", "front"), ("start", "front")]

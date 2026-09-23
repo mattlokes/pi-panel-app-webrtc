@@ -36,11 +36,12 @@ pi-panel-ctl show webrtc --seconds 30                   # try it
 server = "http://frigate.home.local:1984"   # go2rtc
 keep_connected = false     # true: always connected, so there is no delay when it pops up
 linger_seconds = 30        # stay connected this long after being hidden
+signalling = "websocket"   # or "http"; can also be set per camera
 
 [[camera]]
 name = "front_door"        # used in action names: camera_front_door
 label = "Front door"
-src = "front_door_sub"     # go2rtc stream name, or: whep_url = "http://…/whep"
+src = "front_door"         # go2rtc stream name, or: whep_url = "http://…/whep"
 ```
 
 ### Applying changes
@@ -58,16 +59,30 @@ pi-panel-ctl app webrtc io.pipanel.app.WebRTC.Reload    # reports errors
 - **Adding or removing cameras** updates the actions (and the Home Assistant buttons).
 - **If the new file is invalid,** the running configuration stays in effect. The error is logged, and `Reload` returns it as `InvalidConfig`.
 
-The Pi 5 has no H.264 hardware decoder, so video is decoded on the CPU. Use
-a sub stream (640×360 or 720p) rather than a 4K main stream. Measured on a
-Pi 5, a 640×480 sub stream at about 16 fps costs about 6% of one core.
+**Main or sub stream.** The Pi 5 has no H.264 hardware decoder, so video is
+decoded on the CPU. Measured on a Pi 5, for the whole app (decode and display):
 
-**How long before the picture appears.** go2rtc opens a camera only when
-someone asks for it, so on a stream nothing else is watching, go2rtc takes
-about 8 seconds to answer. Most of that time is the camera connection.
-Measured against `front_door_sub`, the app goes from shown to picture in
-about 9 seconds. For a doorbell, set `keep_connected = true`: the feed is
-already playing when it is shown, at the constant cost above.
+| Stream | Resolution | CPU |
+|---|---|---|
+| Reolink main (`front_door`) | 2560×1920, ~10 fps | ~80% of one core (4 cores in total) |
+| Reolink sub (`front_door_sub`) | 640×480, ~16–21 fps | ~6% of one core |
+
+The main stream is sharp on a large screen. The sub stream is blown up and
+looks soft. With `keep_connected = true`, you pay that cost all the time, not
+just while the feed is on screen.
+
+**How long before the picture appears.** With the default
+`signalling = "websocket"`, the picture appears **1.2–2.3s** after the feed is
+shown or reconnected. That time is WebRTC setup plus the camera's next
+keyframe. With `signalling = "http"`, it takes about 9s, because go2rtc's HTTP
+API answers only after gathering its own network addresses, and a LAN-only
+go2rtc spends about 8s waiting for its default STUN server to time out.
+`keep_connected = true` removes even the 1–2s, since the feed is already
+playing when it's shown.
+
+`whep_url` cameras always use HTTP, which WHEP requires. If such a server is
+slow to answer, give it a LAN-only ICE configuration with no public STUN
+server.
 
 WebRTC here is H.264 only. If a camera streams H.265, have go2rtc transcode
 it, e.g. `front_door_h264: ffmpeg:front_door#video=h264`. Otherwise the app
@@ -116,7 +131,8 @@ session (per connection):  webrtcbin ─▶ decodebin ─▶ videoconvert ─▶
 ```
 
 - **The window never closes.** pi-panel only switches to apps with a mapped window, so the display pipeline runs all the time and shows black between connections. A connection is built and torn down separately.
-- **Signalling is non-trickle.** The app gathers every ICE candidate, then POSTs the offer to `{server}/api/webrtc?src=<stream>` (or the WHEP URL) and applies the answer.
+- **Signalling.** The app gathers its own ICE candidates first. With `signalling = "websocket"`, it then sends the offer over go2rtc's `/api/ws?src=<stream>`, applies the answer, and adds the candidates go2rtc trickles afterwards. The socket stays open for the whole connection, because go2rtc stops the stream when it closes. With `signalling = "http"`, it POSTs the offer to `/api/webrtc?src=<stream>` (or the WHEP URL) and applies the answer.
+- **No third-party code.** The WebSocket client (`wsclient.py`) is a small standard-library implementation.
 - **System Python.** The app runs on `/usr/bin/python3`, because PyGObject and gst-python must match the system GStreamer. It has no pip dependencies; pi-panel-varlink is pure Python and found by path.
 
 ## Development
