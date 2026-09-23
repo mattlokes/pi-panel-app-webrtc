@@ -1,0 +1,30 @@
+[package]
+name = "webrtc"
+kind = "app"
+version = "0.1.0"
+description = "Full-screen live camera feed over WebRTC (go2rtc / Frigate, or any WHEP server)"
+
+[run]
+# System Python on purpose: GStreamer's Python bindings (PyGObject and
+# gst-python) come from apt and must match the system GStreamer. The only
+# other dependency, pi-panel-varlink, is pure Python and found by path.
+exec = "/usr/bin/python3 -m pi_panel_webrtc --config ${config_dir}/config.toml"
+env = { PYTHONPATH = "${package_dir}/src:${package_dir}/../../pi-panel-core/pi-panel-core-ctl/packages/pi-panel-varlink/src" }
+
+[config]
+templates = ["config.toml.example"]
+
+[system]
+packages = [
+    "python3-gi",
+    "python3-gst-1.0",             # gst-python overrides: without them promise replies crash
+    "gir1.2-gst-plugins-bad-1.0",  # GstWebRTC / GstSdp typelibs (pulls in Gst, GstBase)
+    "gstreamer1.0-plugins-bad",    # webrtcbin, intervideo*, waylandsink
+    "gstreamer1.0-plugins-good",   # rtp depayloaders
+    "gstreamer1.0-libav",          # avdec_h264
+    "gstreamer1.0-nice",           # ICE for webrtcbin
+]
+
+[app]
+varlink = true
+rotate = false     # a camera is shown on request (doorbell), not in the slideshow

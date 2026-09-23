@@ -1,0 +1,33 @@
+# pi-panel-app-webrtc: a full-screen WebRTC camera feed.
+#
+# Served next to io.pipanel.App on $PI_PANEL_APP_SOCKET. Reach it with
+#   pi-panel-ctl app webrtc io.pipanel.app.WebRTC.GetStatus
+interface io.pipanel.app.WebRTC
+
+type Camera (
+  name: string,
+  label: string,
+  # "go2rtc:<stream>" or a WHEP URL
+  source: string
+)
+
+method ListCameras() -> (cameras: []Camera, current: string)
+
+# Show another camera (connects now if the feed is on screen).
+method SelectCamera(name: string) -> ()
+
+method GetStatus() -> (
+  camera: string,
+  label: string,
+  visible: bool,
+  state: (idle, connecting, playing, retrying),
+  error: ?string,
+  width: ?int,
+  height: ?int,
+  # decoded frames so far in this connection
+  frames: int,
+  connected_for: ?float,
+  retry_in: ?float
+)
+
+error NoSuchCamera (name: string)

@@ -1,0 +1,26 @@
+# pi-panel-app-webrtc configuration.
+# pi-panel-pkg copies this to ~/.config/pi-panel/apps/webrtc/config.toml.
+
+# go2rtc's API (standalone, Frigate's built-in one, or the Home Assistant add-on).
+server = "http://frigate.home.local:1984"
+
+# Connect only while the feed is on screen (plus linger_seconds after it is
+# hidden, so flicking away and back does not reconnect). true keeps the feed
+# connected and decoding all the time: no connect delay when a doorbell
+# brings it up, at the cost of constant CPU and network use.
+keep_connected = false
+linger_seconds = 30
+
+# The first camera is shown at start. Switch with the camera_<name> actions,
+# next/previous, or io.pipanel.app.WebRTC.SelectCamera.
+[[camera]]
+name = "front_door"            # lowercase, digits, '-' or '_': used in action names
+label = "Front door"
+src = "front_door_sub"         # go2rtc stream name. The _sub stream decodes far
+                               # cheaper; the Pi 5 has no H.264 hardware decoder.
+
+# Any other WHEP server (e.g. MediaMTX) instead of go2rtc:
+# [[camera]]
+# name = "garage"
+# label = "Garage"
+# whep_url = "http://mediamtx.local:8889/garage/whep"
