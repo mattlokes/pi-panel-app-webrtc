@@ -94,6 +94,25 @@ class Controller:
         self._stop_session()
         self.tick()
 
+    def reconfigure(self, config: Config) -> None:
+        """Adopt a reloaded config without a restart.
+
+        The current camera stays selected if it still exists (by name), and
+        its connection is kept unless something it depends on changed (its
+        source, or the server). The policy settings (keep_connected,
+        linger_seconds) apply from the next tick.
+        """
+        current = self.camera
+        old_url = current.offer_url(self.config.server)
+        self.config = config
+        new = config.camera(current.name)
+        self.index = config.cameras.index(new) if new else 0
+        if self.session is not None and (
+                new is None or new.offer_url(config.server) != old_url or new != current):
+            self._stop_session()
+        self.tick()
+        self.on_change()
+
     def shutdown(self) -> None:
         self._stop_session()
 

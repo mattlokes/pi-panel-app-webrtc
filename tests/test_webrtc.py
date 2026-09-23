@@ -215,3 +215,52 @@ def test_reconnect_and_status():
     assert s["camera"] == "front" and s["state"] == "connecting" and s["width"] == 640
     ctl.shutdown()
     assert log[-1] == ("stop", "front") and ctl.status()["state"] == "idle"
+
+
+# --- reload -------------------------------------------------------------------------
+
+def cfg(**kw):
+    base = {"server": "http://x", "camera": [{"name": "front", "src": "front_sub"},
+                                               {"name": "back", "src": "back_sub"}]}
+    return Config.from_dict(base | kw)
+
+
+def test_reload_policy_change_keeps_the_connection():
+    ctl, log, clock = make(cameras=("front", "back"))
+    ctl.config = cfg()
+    ctl.set_visible(True)
+    ctl.set_visible(False)
+    ctl.reconfigure(cfg(keep_connected=True, linger_seconds=5))
+    clock.t += 1000
+    ctl.tick()
+    assert log == [("start", "front")]           # never dropped: keep_connected now
+
+
+def test_reload_turning_keep_connected_off_disconnects_when_hidden():
+    ctl, log, clock = make(keep=True, cameras=("front", "back"))
+    ctl.reconfigure(cfg(keep_connected=False, linger_seconds=0))
+    assert log == [("start", "front"), ("stop", "front")]
+
+
+def test_reload_changed_source_or_server_reconnects():
+    ctl, log, _ = make(cameras=("front", "back"))
+    ctl.config = cfg()
+    ctl.set_visible(True)
+    ctl.reconfigure(cfg(camera=[{"name": "front", "src": "front_main"}]))
+    assert log[-2:] == [("stop", "front"), ("start", "front")]
+    ctl.reconfigure(cfg(server="http://y", camera=[{"name": "front", "src": "front_main"}]))
+    assert log[-2:] == [("stop", "front"), ("start", "front")]
+    n = len(log)
+    ctl.reconfigure(cfg(server="http://y", camera=[{"name": "front", "src": "front_main"}]))
+    assert len(log) == n                         # nothing changed: nothing restarted
+
+
+def test_reload_keeps_the_selected_camera_or_falls_back():
+    ctl, log, _ = make(cameras=("front", "back"))
+    ctl.config = cfg()
+    ctl.set_visible(True)
+    ctl.select("back")
+    ctl.reconfigure(cfg(camera=[{"name": "side", "src": "s"}, {"name": "back", "src": "back_sub"}]))
+    assert ctl.camera.name == "back" and log[-1] == ("start", "back")   # same camera, kept
+    ctl.reconfigure(cfg(camera=[{"name": "side", "src": "s"}]))          # "back" removed
+    assert ctl.camera.name == "side" and log[-2:] == [("stop", "back"), ("start", "side")]

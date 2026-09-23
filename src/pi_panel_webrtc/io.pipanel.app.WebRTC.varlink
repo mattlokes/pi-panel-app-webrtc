@@ -30,4 +30,9 @@ method GetStatus() -> (
   retry_in: ?float
 )
 
+# Re-read config.toml (as SIGHUP does). On an invalid file the running
+# configuration stays in effect and InvalidConfig says why.
+method Reload() -> (cameras: []Camera, current: string)
+
 error NoSuchCamera (name: string)
+error InvalidConfig (message: string)

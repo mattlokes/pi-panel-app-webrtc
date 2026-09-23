@@ -43,6 +43,21 @@ label = "Front door"
 src = "front_door_sub"     # go2rtc stream name, or: whep_url = "http://…/whep"
 ```
 
+### Applying changes
+
+Edit `config.toml`, then reload. No restart is needed:
+
+```bash
+pi-panel-ctl action webrtc reload                       # or:
+systemctl kill -s HUP pi-panel-app@webrtc              # or:
+pi-panel-ctl app webrtc io.pipanel.app.WebRTC.Reload    # reports errors
+```
+
+- **Policy changes** (`keep_connected`, `linger_seconds`) apply at once, without dropping the feed.
+- **Changing a camera's source, or the server,** reconnects that camera.
+- **Adding or removing cameras** updates the actions (and the Home Assistant buttons).
+- **If the new file is invalid,** the running configuration stays in effect. The error is logged, and `Reload` returns it as `InvalidConfig`.
+
 The Pi 5 has no H.264 hardware decoder, so video is decoded on the CPU. Use
 a sub stream (640×360 or 720p) rather than a 4K main stream. Measured on a
 Pi 5, a 640×480 sub stream at about 16 fps costs about 6% of one core.
@@ -80,7 +95,7 @@ seconds.
 ## Control
 
 ```bash
-pi-panel-ctl action webrtc next                      # also: previous, reconnect, camera_<name>
+pi-panel-ctl action webrtc next                      # also: previous, reconnect, reload, camera_<name>
 pi-panel-ctl app webrtc io.pipanel.app.WebRTC.GetStatus
 pi-panel-ctl app webrtc io.pipanel.app.WebRTC.SelectCamera '{"name": "front_door"}'
 journalctl -u pi-panel-app@webrtc -f

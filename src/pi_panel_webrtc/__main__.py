@@ -59,15 +59,40 @@ def on_main(fn, *args) -> None:
     return result[0] if result else None
 
 
-def webrtc_interface(controller: Controller) -> Interface:
+def camera_list(controller: Controller) -> dict:
+    return {"cameras": [{"name": c.name, "label": c.label, "source": c.source}
+                        for c in controller.config.cameras],
+            "current": controller.camera.name}
+
+
+def camera_actions(controller: Controller, idle, reload) -> dict:
+    """The io.pipanel.App actions; rebuilt on reload, since cameras may change."""
+    actions = {
+        "next": ("Next camera", lambda: idle(controller.step, +1)),
+        "previous": ("Previous camera", lambda: idle(controller.step, -1)),
+        "reconnect": ("Reconnect", lambda: idle(controller.reconnect)),
+        "reload": ("Reload config", lambda: idle(reload)),
+    }
+    for cam in controller.config.cameras:
+        actions[f"camera_{cam.name}"] = (f"Show {cam.label}",
+                                         lambda n=cam.name: idle(controller.select, n))
+    return actions
+
+
+def webrtc_interface(controller: Controller, reload) -> Interface:
     iface = Interface(files(__package__).joinpath("io.pipanel.app.WebRTC.varlink")
                       .read_text(encoding="utf-8"))
 
     @iface.method("ListCameras")
     async def list_cameras(call: Call) -> dict:
-        return {"cameras": [{"name": c.name, "label": c.label, "source": c.source}
-                            for c in controller.config.cameras],
-                "current": controller.camera.name}
+        return camera_list(controller)
+
+    @iface.method("Reload")
+    async def reload_method(call: Call) -> dict:   # not `reload`: that is the callable
+        error = on_main(reload)
+        if error:
+            raise VarlinkError("io.pipanel.app.WebRTC.InvalidConfig", {"message": error})
+        return camera_list(controller)
 
     @iface.method("SelectCamera")
     async def select_camera(call: Call) -> None:
@@ -115,7 +140,9 @@ def main() -> int:
 
     controller = Controller(
         config,
-        make_session=lambda cam: CameraSession(cam, config.server, CHANNEL, on_change=refresh),
+        # controller.config, not config: a reload may change the server.
+        make_session=lambda cam: CameraSession(cam, controller.config.server, CHANNEL,
+                                               on_change=refresh),
         clock=time.monotonic,
         on_change=refresh,
     )
@@ -123,19 +150,25 @@ def main() -> int:
     def idle(fn, *a) -> None:
         GLib.idle_add(lambda: fn(*a) and False)
 
-    actions = {
-        "next": ("Next camera", lambda: idle(controller.step, +1)),
-        "previous": ("Previous camera", lambda: idle(controller.step, -1)),
-        "reconnect": ("Reconnect", lambda: idle(controller.reconnect)),
-    }
-    for cam in config.cameras:
-        actions[f"camera_{cam.name}"] = (f"Show {cam.label}", lambda n=cam.name: idle(controller.select, n))
+    def do_reload() -> str | None:
+        try:
+            new = Config.load(args.config)
+        except ConfigError as exc:
+            log.error("reload failed, keeping the running config: %s", exc)
+            return str(exc)
+        controller.reconfigure(new)
+        # Cameras may have come or gone. Swap the whole dict in one step: the
+        # service thread reads it concurrently.
+        service.actions = camera_actions(controller, idle, do_reload)
+        log.info("config reloaded: cameras %s, keep_connected=%s, linger %ss",
+                 ", ".join(c.name for c in new.cameras), new.keep_connected, new.linger_seconds)
+        return None
 
     service = AppService(
         product="pi-panel-app-webrtc", version="0.1.0",
         on_visible=lambda visible: idle(controller.set_visible, visible),
-        actions=actions,
-        interfaces=[webrtc_interface(controller)],
+        actions=camera_actions(controller, idle, do_reload),
+        interfaces=[webrtc_interface(controller, do_reload)],
     )
     under_panel = service.start()
     if not under_panel:
@@ -146,6 +179,8 @@ def main() -> int:
     # app contract's 5 seconds.
     for sig in (signal.SIGTERM, signal.SIGINT):
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, lambda: loop.quit() or False)
+    # SIGHUP: re-read config.toml (`systemctl kill -s HUP pi-panel-app@webrtc`).
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGHUP, lambda: (do_reload(), True)[1])
 
     try:
         display.start()
