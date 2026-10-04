@@ -101,8 +101,8 @@ doesn't report its frame sizes, so GStreamer fails with "Unsupported pixel
 format". `decoder = "auto"` (the default) falls back to software if the
 hardware decoder fails, until the next reload.
 
-If the camera itself can't send H.265, go2rtc can transcode. For example, on
-an Intel GPU (Frigate's go2rtc):
+If the camera itself can't send H.265, go2rtc can transcode. For example, with
+VAAPI (Frigate's go2rtc; the host has an AMD GPU):
 
 ```yaml
 front_door_hevc:

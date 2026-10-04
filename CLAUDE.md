@@ -13,7 +13,7 @@ Frigate 0.18; the Frigate UI is on :5000). `frigate.home.local` still
 resolves to the old host, .97. The streams:
 - `front_door`: H.264 from the Reolink doorbell over RTSP, 2560×1920 at about 10 fps. The app costs about 45% of one core on it. Frigate pulls this stream constantly.
 - `front_door_sub`: H.264, 640×480.
-- `front_door_hevc`: an on-demand `exec:` transcode on Frigate's Intel GPU (`hevc_vaapi`), H.265 Main 1536×1152 at 25 fps, 6 Mbps. The app costs about 5% of one core on it (v4l2), or about 50% with `decoder = "software"`.
+- `front_door_hevc`: an on-demand `exec:` transcode on the Frigate host's AMD GPU (VAAPI `hevc_vaapi`), H.265 Main 1536×1152 at 25 fps, 6 Mbps. The app costs about 5% of one core on it (v4l2), or about 50% with `decoder = "software"`.
 
 jazz must run kernel ≥ 6.18 for the HEVC decoder (it runs 6.18.50+rpt).
 
@@ -32,7 +32,7 @@ jazz must run kernel ≥ 6.18 for the HEVC decoder (it runs 6.18.50+rpt).
 - **No decodebin for H.265.** `v4l2slh265dec` (rank 257) outranks `avdec_h265` (256). The decoder is chosen explicitly by `decoders.DecoderLadder`: with `auto`, a v4l2 failure (a bus error in its branch, a missing element, or coded input but no frames) switches the process to software until a reload.
 - **Offer only the codec go2rtc knows the stream has** (`/api/streams?src=`). Offered H.265 first for the H.264 `front_door`, go2rtc 1.9.14 answered H.265 and sent nothing. Its not-yet-started `ffmpeg:` producer seems to match any codec. When go2rtc doesn't know the codec, offer H.265 then H.264.
 - **`hevc_vaapi` dimensions must be multiples of 64.** At 1440×1080, Frigate's encoder sent 1472×1088 with no conformance window, so every decoder showed garbage edges.
-- **go2rtc's exec transcode can wedge.** On 2026-10-04, after a lot of rapid connect/disconnect testing, `front_door_hevc` stopped (`read … i/o timeout`), and every later start logged `[exec] timeout`; even a plain RTSP probe failed. It is a Frigate-side problem, which the app sees as "no video within 20s". go2rtc's log: `GET http://192.168.4.145:5000/api/logs/go2rtc`.
+- **go2rtc's exec transcode can wedge.** On 2026-10-04, after a lot of rapid connect/disconnect testing, `front_door_hevc` stopped (`read … i/o timeout`), and every later start logged `[exec] timeout`; even a plain RTSP probe failed. It was the host's **amdgpu** hanging, not go2rtc. After a Frigate restart, Frigate logged "Did not detect hwaccel", and every VAAPI ffmpeg, including Frigate's own detect, failed with `amdgpu_query_gpu_info_init failed` and then hung. Restarting Frigate doesn't help; the host needs a reboot. The app sees it as "no video within 20s". go2rtc's log: `GET http://192.168.4.145:5000/api/logs/go2rtc`.
 - **Open: one SEGV during switch churn.** It happened once on 2026-10-04: next, reconnect and next again at 1–1.5s intervals, H.265 (v4l2) ⇄ H.264, under the unit. About 140 more iterations, including randomised gaps down to 0.1s, didn't reproduce it. The manifest sets `PYTHONFAULTHANDLER=1`, so the next one leaves every thread's Python stack in the journal.
 - **`controller.py` has no GStreamer.** It holds the connection policy (visible, linger, keep_connected) and camera switching, and is unit-tested with a fake session and clock. Keep policy there.
 - **Every webrtcbin callback marshals to the GLib loop,** tagged with a generation (`CameraSession._on_main` / `_timer`). A late callback from a torn-down connection must never touch the next one.
