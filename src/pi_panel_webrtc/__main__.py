@@ -27,9 +27,9 @@ from pi_panel_varlink import AppService, Call, Interface, VarlinkError  # noqa: 
 
 from .config import Config, ConfigError  # noqa: E402
 from .controller import Controller  # noqa: E402
+from .decoders import DecoderLadder  # noqa: E402
 
 log = logging.getLogger("pi-panel-webrtc")
-CHANNEL = "pi-panel-webrtc"
 
 
 def overlay_text(status: dict[str, Any]) -> str:
@@ -61,7 +61,7 @@ def on_main(fn, *args) -> None:
 
 def camera_list(controller: Controller) -> dict:
     return {"cameras": [{"name": c.name, "label": c.label, "source": c.source,
-                         "signalling": c.signalling}
+                         "signalling": c.signalling, "decoder": c.decoder}
                         for c in controller.config.cameras],
             "current": controller.camera.name}
 
@@ -134,7 +134,8 @@ def main() -> int:
         exit_code[0] = 1
         loop.quit()
 
-    display = Display(CHANNEL, on_fatal=fatal)
+    display = Display(on_fatal=fatal)
+    ladder = DecoderLadder()     # shared: a failed hardware decoder stays failed
 
     def refresh() -> None:
         display.set_text(overlay_text(controller.status()))
@@ -142,7 +143,7 @@ def main() -> int:
     controller = Controller(
         config,
         # controller.config, not config: a reload may change the server.
-        make_session=lambda cam: CameraSession(cam, controller.config.server, CHANNEL,
+        make_session=lambda cam: CameraSession(cam, controller.config.server, display, ladder,
                                                on_change=refresh),
         clock=time.monotonic,
         on_change=refresh,
@@ -157,6 +158,7 @@ def main() -> int:
         except ConfigError as exc:
             log.error("reload failed, keeping the running config: %s", exc)
             return str(exc)
+        ladder.reset()           # e.g. after an upgrade fixed the hardware decoder
         controller.reconfigure(new)
         # Cameras may have come or gone. Swap the whole dict in one step: the
         # service thread reads it concurrently.

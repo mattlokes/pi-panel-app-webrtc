@@ -10,7 +10,9 @@ type Camera (
   # "go2rtc:<stream>" or a WHEP URL
   source: string,
   # how the offer is exchanged: go2rtc's WebSocket API, or HTTP (WHEP style)
-  signalling: (websocket, http)
+  signalling: (websocket, http),
+  # H.265 decoder: hardware (falling back to software), or forced
+  decoder: (auto, v4l2, software)
 )
 
 method ListCameras() -> (cameras: []Camera, current: string)
@@ -23,6 +25,10 @@ method GetStatus() -> (
   label: string,
   visible: bool,
   state: (idle, connecting, playing, retrying),
+  # what the server sends, once the connection is negotiated
+  codec: ?(h264, h265),
+  # in use: the Pi 5's HEVC block, avdec_h265, or (H.264) avdec_h264
+  decoder: ?(v4l2, software, libav),
   error: ?string,
   width: ?int,
   height: ?int,

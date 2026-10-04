@@ -31,7 +31,7 @@ class Session(Protocol):
     def state(self) -> str: ...          # connecting | playing | retrying
     def start(self) -> None: ...
     def stop(self) -> None: ...
-    def status(self) -> dict[str, Any]: ...  # error, width, height, frames, connected_for
+    def status(self) -> dict[str, Any]: ...  # codec, decoder, error, width, height, frames, …
 
 
 SessionFactory = Callable[[Camera], Session]
@@ -64,8 +64,8 @@ class Controller:
 
     def status(self) -> dict[str, Any]:
         base = {"camera": self.camera.name, "label": self.camera.label, "visible": self.visible,
-                "state": IDLE, "error": None, "width": None, "height": None, "frames": 0,
-                "connected_for": None}
+                "state": IDLE, "codec": None, "decoder": None, "error": None, "width": None,
+                "height": None, "frames": 0, "connected_for": None}
         if self.session is not None:
             base.update(self.session.status())
             base["state"] = self.session.state

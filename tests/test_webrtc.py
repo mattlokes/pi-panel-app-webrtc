@@ -438,3 +438,125 @@ def test_reload_changing_signalling_reconnects():
     ctl.set_visible(True)
     ctl.reconfigure(cfg(camera=[{"name": "front", "src": "front_sub", "signalling": "http"}]))
     assert log[-2:] == [("stop", "front"), ("start", "front")]
+
+
+# --- H.265: the codec in the answer, and the decoder -------------------------------------
+
+from pi_panel_webrtc.decoders import DecoderLadder
+from pi_panel_webrtc.signalling import answer_codec
+
+
+def _sdp(*media):
+    return "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n" + "".join(media)
+
+
+H265 = "m=video 9 UDP/TLS/RTP/SAVPF 97\r\na=rtpmap:97 H265/90000\r\n"
+H264 = "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 H264/90000\r\n"
+
+
+@pytest.mark.parametrize("sdp,codec", [
+    (_sdp(H265), "h265"),
+    (_sdp(H264), "h264"),
+    # both answered: the server's order wins
+    (_sdp("m=video 9 UDP/TLS/RTP/SAVPF 97 96\r\na=rtpmap:96 H264/90000\r\na=rtpmap:97 H265/90000\r\n"), "h265"),
+    (_sdp("m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\na=rtpmap:96 H264/90000\r\na=rtpmap:97 H265/90000\r\n"), "h264"),
+    # rtx first, and an audio section's H265-looking rtpmap is not ours
+    (_sdp("m=audio 9 UDP/TLS/RTP/SAVPF 97\r\na=rtpmap:97 H264/90000\r\n",
+          "m=video 9 UDP/TLS/RTP/SAVPF 99 97\r\na=rtpmap:99 rtx/90000\r\na=rtpmap:97 h265/90000\r\n"), "h265"),
+    (_sdp("m=video 9 UDP/TLS/RTP/SAVPF 100\r\na=rtpmap:100 VP8/90000\r\n"), None),
+    (_sdp("m=video 0 UDP/TLS/RTP/SAVPF 97\r\na=rtpmap:97 H265/90000\r\n"), None),   # rejected
+    (_sdp(), None),
+])
+def test_answer_codec(sdp, codec):
+    assert answer_codec(sdp) == codec
+
+
+def test_decoder_ladder():
+    ladder = DecoderLadder()
+    assert ladder.pick("auto") == "v4l2"
+    assert ladder.pick("software") == "software"
+    assert ladder.failed("v4l2") is True            # auto changes its mind
+    assert ladder.failed("v4l2") is False           # once
+    assert ladder.pick("auto") == "software"
+    assert ladder.pick("v4l2") == "v4l2"            # explicit: no fallback
+    ladder.reset()
+    assert ladder.pick("auto") == "v4l2"
+
+
+def test_decoder_defaults_and_overrides():
+    c = Config.from_dict({"server": "http://x", "camera": [
+        {"name": "a", "src": "a"}, {"name": "b", "src": "b", "decoder": "software"}]})
+    assert [x.decoder for x in c.cameras] == ["auto", "software"]
+    c = Config.from_dict({"server": "http://x", "decoder": "v4l2", "camera": [
+        {"name": "a", "src": "a"}, {"name": "b", "whep_url": "http://m/b/whep", "decoder": "auto"}]})
+    assert [x.decoder for x in c.cameras] == ["v4l2", "auto"]
+
+
+@pytest.mark.parametrize("data,msg", [
+    ({"server": "http://x", "decoder": "gpu", "camera": [{"name": "a", "src": "a"}]}, "decoder"),
+    ({"server": "http://x", "camera": [{"name": "a", "src": "a", "decoder": "ffmpeg"}]}, "decoder"),
+])
+def test_decoder_rejects(data, msg):
+    with pytest.raises(ConfigError, match=msg):
+        Config.from_dict(data)
+
+
+def test_reload_changing_decoder_reconnects():
+    ctl, log, _ = make(cameras=("front", "back"))
+    ctl.config = cfg()
+    ctl.set_visible(True)
+    ctl.reconfigure(cfg(camera=[{"name": "front", "src": "front_sub", "decoder": "software"}]))
+    assert log[-2:] == [("stop", "front"), ("start", "front")]
+
+
+# --- which codecs to offer go2rtc ----------------------------------------------------
+
+from pi_panel_webrtc.signalling import offer_codecs, stream_codecs, video_codecs
+
+
+def test_video_codecs_from_go2rtc_stream():
+    # front_door on go2rtc 1.9.14: RTSP producer running, ffmpeg producer not started
+    stream = {"producers": [
+        {"medias": ["video, recvonly, H264", "audio, recvonly, MPEG4-GENERIC/16000",
+                    "audio, sendonly, PCMU/8000"]},
+        {"url": "ffmpeg:front_door#audio=opus"}]}
+    assert video_codecs(stream) == {"h264"}
+    assert video_codecs({"producers": [{"medias": ["video, recvonly, H265"]}]}) == {"h265"}
+    assert video_codecs({"producers": [{"medias": None}]}) == set()
+    assert video_codecs({}) == set()
+
+
+def test_offer_codecs():
+    assert offer_codecs({"h264"}) == ["h264"]
+    assert offer_codecs({"h265"}) == ["h265"]
+    assert offer_codecs({"h264", "h265"}) == ["h265", "h264"]
+    assert offer_codecs(set()) == ["h265", "h264"]          # not running yet: H.265 first
+    assert offer_codecs({"mjpeg"}) == ["h265", "h264"]
+
+
+def test_stream_codecs_over_http():
+    import json as _j
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if "src=front_door" in self.path:
+                body = _j.dumps({"producers": [{"medias": ["video, recvonly, H264"]}]}).encode()
+                self.send_response(200)
+            else:
+                body = b"stream not found"
+                self.send_response(404)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}/"
+    try:
+        assert stream_codecs(base, "front_door") == {"h264"}
+        assert stream_codecs(base, "missing") == set()
+        assert stream_codecs("http://127.0.0.1:9", "x", timeout=1) == set()
+    finally:
+        server.shutdown()

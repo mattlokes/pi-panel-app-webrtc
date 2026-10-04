@@ -21,16 +21,28 @@ linger_seconds = 30
 # whep_url cameras always use "http".
 signalling = "websocket"
 
+# H.265 streams decode on the Pi 5's HEVC hardware and go to the screen
+# without a copy (about 5% of a core for 1536x1152 at 25 fps, against about
+# 50% in software). It needs kernel 6.18 or newer. H.264 always decodes in
+# software: the Pi 5 has no H.264 hardware. H.265 is used whenever the stream
+# is H.265; nothing needs setting.
+#   "auto"      hardware; if it fails once, software until a reload. The default.
+#   "v4l2"      hardware only (retries on failure, never falls back)
+#   "software"  avdec_h265 on the CPU
+# Per camera, too.
+decoder = "auto"
+
 # The first camera is shown at start. Switch with the camera_<name> actions,
 # next/previous, or io.pipanel.app.WebRTC.SelectCamera.
 [[camera]]
 name = "front_door"            # lowercase, digits, '-' or '_': used in action names
 label = "Front door"
-src = "front_door"             # go2rtc stream name. The Pi 5 has no H.264 hardware
-                               # decoder: a 2560x1920 main stream costs about half a
-                               # core, a 640x480 sub stream (e.g. "front_door_sub")
-                               # about 6%, but looks soft full screen.
-# signalling = "http"          # per-camera override
+src = "front_door"             # go2rtc stream name. An H.265 stream is far cheaper
+                               # here than H.264 (hardware decode), e.g. a go2rtc
+                               # transcode (see the README); an H.264 2560x1920 main
+                               # stream costs about half a core.
+# signalling = "http"          # per-camera overrides
+# decoder = "software"
 
 # Any other WHEP server (e.g. MediaMTX) instead of go2rtc:
 # [[camera]]

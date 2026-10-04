@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from .decoders import DECODERS
+
 _NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 SIGNALLING = ("websocket", "http")
 
@@ -26,6 +28,8 @@ class Camera:
     # "websocket": go2rtc's /api/ws (answers at once, trickles ICE);
     # "http": go2rtc's POST /api/webrtc, or WHEP (waits for the server's ICE gathering)
     signalling: str = "websocket"
+    # H.265 only: "auto" (hardware, falling back to software), "v4l2" or "software"
+    decoder: str = "auto"
 
     def offer_url(self, server: str) -> str:
         """Where to POST the SDP offer. go2rtc's /api/webrtc speaks WHEP."""
@@ -45,6 +49,7 @@ class Config:
     keep_connected: bool = False
     linger_seconds: float = 30.0
     signalling: str = "websocket"
+    decoder: str = "auto"
 
     def camera(self, name: str) -> Camera | None:
         return next((c for c in self.cameras if c.name == name), None)
@@ -62,7 +67,8 @@ class Config:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Config":
-        unknown = set(data) - {"server", "camera", "keep_connected", "linger_seconds", "signalling"}
+        unknown = set(data) - {"server", "camera", "keep_connected", "linger_seconds", "signalling",
+                               "decoder"}
         if unknown:
             raise ConfigError(f"unknown key(s): {', '.join(sorted(unknown))}")
         server = data.get("server", "")
@@ -77,6 +83,9 @@ class Config:
         default_signalling = data.get("signalling", "websocket")
         if default_signalling not in SIGNALLING:
             raise ConfigError(f"signalling must be one of: {', '.join(SIGNALLING)}")
+        default_decoder = data.get("decoder", "auto")
+        if default_decoder not in DECODERS:
+            raise ConfigError(f"decoder must be one of: {', '.join(DECODERS)}")
 
         raw = data.get("camera", [])
         if not isinstance(raw, list) or not raw:
@@ -85,7 +94,7 @@ class Config:
         for i, c in enumerate(raw):
             if not isinstance(c, dict):
                 raise ConfigError(f"camera {i} must be a table")
-            extra = set(c) - {"name", "label", "src", "whep_url", "signalling"}
+            extra = set(c) - {"name", "label", "src", "whep_url", "signalling", "decoder"}
             if extra:
                 raise ConfigError(f"camera {i}: unknown key(s): {', '.join(sorted(extra))}")
             name = c.get("name")
@@ -107,6 +116,11 @@ class Config:
                 if signalling == "websocket":
                     raise ConfigError(f"camera {name!r}: whep_url cameras use signalling = \"http\"")
                 signalling = "http"
-            cameras.append(Camera(name, str(label), src, whep, signalling or default_signalling))
+            decoder = c.get("decoder", default_decoder)
+            if decoder not in DECODERS:
+                raise ConfigError(f"camera {name!r}: decoder must be one of: {', '.join(DECODERS)}")
+            cameras.append(Camera(name, str(label), src, whep, signalling or default_signalling,
+                                  decoder))
         return cls(server=server, cameras=tuple(cameras), keep_connected=keep,
-                   linger_seconds=float(linger), signalling=default_signalling)
+                   linger_seconds=float(linger), signalling=default_signalling,
+                   decoder=default_decoder)

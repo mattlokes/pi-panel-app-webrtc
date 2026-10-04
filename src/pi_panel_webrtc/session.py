@@ -1,11 +1,25 @@
 """One WebRTC connection to one camera, with GStreamer's webrtcbin.
 
-    webrtcbin (one recvonly H.264 transceiver)
-      └─ pad-added ─▶ decodebin ─▶ videoconvert ─▶ intervideosink channel=<display>
+    webrtcbin (one recvonly video transceiver: H.265 preferred, or H.264)
+      └─ pad-added, by the RTP encoding the server chose:
+         H265, v4l2:     rtph265depay ─▶ h265parse ─▶ v4l2slh265dec (DMABuf) ─▶ proxysink
+         H265, software: rtph265depay ─▶ h265parse ─▶ avdec_h265 ─▶ videoconvert BGRx ─▶ proxysink
+         H264:           decodebin ─▶ videoconvert BGRx ─▶ proxysink
 
-The decoded frames go to the always-running display pipeline through an
-intervideo channel, so the window stays mapped however often this session is
-torn down and rebuilt.
+The proxysink feeds the always-running display pipeline (display.py), so the
+window stays mapped however often this session is torn down and rebuilt. On
+the v4l2 path the frames stay DMABufs all the way to the compositor.
+
+H.265 never goes through decodebin. v4l2slh265dec outranks avdec_h265, so
+decodebin would always pick it, and the decoder is a choice
+(`decoder = auto | v4l2 | software`, see decoders.py). With "auto", a v4l2
+failure switches the process to software.
+
+Codecs: for a go2rtc camera, first ask go2rtc (`/api/streams?src=`) which
+video codec the stream has. If it knows, offer only that one: go2rtc answers
+a codec it can't serve, and then sends nothing (see
+signalling.offer_codecs). Otherwise, and for WHEP servers, offer H.265 then
+H.264.
 
 Signalling: create the offer, set it locally, wait for our ICE gathering to
 complete (about 0.35s), then, on a worker thread, per `camera.signalling`:
@@ -47,11 +61,18 @@ gi.require_version("GstWebRTC", "1.0")
 from gi.repository import GLib, Gst, GstSdp, GstWebRTC  # noqa: E402
 
 from .config import Camera  # noqa: E402
-from .signalling import Go2rtcSocket, SignallingError, post_offer  # noqa: E402
+from .decoders import DecoderLadder  # noqa: E402
+from .signalling import (CODECS, Go2rtcSocket, SignallingError, answer_codec,  # noqa: E402
+                         offer_codecs, post_offer, stream_codecs)
 
 log = logging.getLogger("pi-panel-webrtc")
 
-VIDEO_CAPS = "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000"
+# The transceiver's codecs, offered in the order given (see offer_codecs).
+RTP_CAPS = {
+    "h265": "application/x-rtp,media=video,encoding-name=H265,payload=97,clock-rate=90000",
+    "h264": "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000",
+}
+H265_DECODERS = {"v4l2": "v4l2slh265dec", "software": "avdec_h265"}
 CONNECT_TIMEOUT = 20.0     # offer → first frame
 STALL_TIMEOUT = 10.0       # playing, but no frame for this long
 DISCONNECT_GRACE = 5.0     # ICE "disconnected" often recovers on its own
@@ -71,17 +92,23 @@ def _field(structure: Any, name: str) -> Any:
 
 
 class CameraSession:
-    def __init__(self, camera: Camera, server: str, channel: str,
+    def __init__(self, camera: Camera, server: str, display: Any, ladder: DecoderLadder,
                  on_change: Callable[[], None]) -> None:
         self.camera = camera
         self.server = server
         self.url = camera.offer_url(server)
-        self.channel = channel
+        self.display = display          # display.Display: attach()/detach() our proxysink
+        self.ladder = ladder
         self.on_change = on_change
         self._state = IDLE
         self._gen = 0
         self._pipeline: Gst.Pipeline | None = None
         self._webrtc: Gst.Element | None = None
+        self._out: Gst.Element | None = None   # proxysink, read by the display
+        self.codec: str | None = None           # "h264" | "h265", from the answer
+        self.decoder: str | None = None         # "v4l2" | "software" | "libav"
+        self._v4l2_branch: set[str] = set()     # element names, to blame bus errors
+        self._coded = 0                         # buffers into the H.265 decoder
         self._keep: list[Any] = []          # descriptions webrtcbin still needs
         self._socket: Go2rtcSocket | None = None
         self._socket_lock = threading.Lock()   # the worker hands the socket over under it
@@ -108,6 +135,8 @@ class CameraSession:
     def status(self) -> dict[str, Any]:
         now = time.monotonic()
         return {
+            "codec": self.codec,
+            "decoder": self.decoder,
             "error": self.error,
             "width": self.width,
             "height": self.height,
@@ -163,6 +192,11 @@ class CameraSession:
         for t in self._timers:
             GLib.source_remove(t)
         self._timers.clear()
+        if self._out is not None:
+            # Off screen first: waylandsink must let go of our buffers (the
+            # decoder's DMABufs) before this pipeline goes away.
+            self.display.detach(self._out)
+            self._out = None
         if self._pipeline is not None:
             bus = self._pipeline.get_bus()
             bus.remove_signal_watch()
@@ -196,8 +230,25 @@ class CameraSession:
         self._teardown()
         self._posted = False
         self.width = self.height = None
+        self.codec = self.decoder = None
+        self._v4l2_branch = set()
+        self._coded = self.frames = 0
         self._set_state(CONNECTING)
+        self._timer(CONNECT_TIMEOUT, self._connect_timeout)
+        if not self.camera.src:
+            self._build(list(CODECS))       # a WHEP server: offer both, H.265 first
+            return
+        # go2rtc: offer only the codec the stream is known to have, if any
+        # (see offer_codecs). One quick HTTP request, off the main loop.
+        gen = self._gen
 
+        def probe() -> None:
+            known = stream_codecs(self.server, self.camera.src or "")
+            self._from_thread(gen, self._build, offer_codecs(known))
+        threading.Thread(target=probe, name="webrtc-probe", daemon=True).start()
+
+    def _build(self, codecs: list[str]) -> None:
+        log.debug("%s: offering %s", self.camera.name, ", ".join(codecs))
         pipe = Gst.Pipeline.new(f"webrtc-{self.camera.name}")
         webrtc = Gst.ElementFactory.make("webrtcbin", "webrtc")
         if webrtc is None:
@@ -210,18 +261,45 @@ class CameraSession:
         webrtc.connect("notify::connection-state", self._on_connection_state)
         webrtc.connect("pad-added", self._on_pad_added)
         webrtc.emit("add-transceiver", GstWebRTC.WebRTCRTPTransceiverDirection.RECVONLY,
-                    Gst.Caps.from_string(VIDEO_CAPS))
+                    Gst.Caps.from_string(";".join(RTP_CAPS[c] for c in codecs)))
+        # Where the decoded video leaves: the display attaches to it once the
+        # answer is in, and the media branch links to it on pad-added.
+        out = Gst.ElementFactory.make("proxysink", "out")
+        if out is None:
+            self._retry("proxysink is missing (install gstreamer1.0-plugins-bad)")
+            return
+        pipe.add(out)
+        out.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._on_frame)
 
         bus = pipe.get_bus()
         bus.add_signal_watch()
         gen = self._gen
-        bus.connect("message::error", lambda _b, m: gen == self._gen and self._retry(
-            f"pipeline error: {m.parse_error()[0].message}"))
+        bus.connect("message::error", lambda _b, m: gen == self._gen and self._on_error(m))
 
-        self._pipeline, self._webrtc = pipe, webrtc
+        self._pipeline, self._webrtc, self._out = pipe, webrtc, out
         pipe.set_state(Gst.State.PLAYING)
-        self._timer(CONNECT_TIMEOUT, lambda: self._state == CONNECTING and self._retry(
-            f"no video within {CONNECT_TIMEOUT:.0f}s"))
+
+    def _connect_timeout(self) -> None:
+        if self._state != CONNECTING:
+            return
+        if self.decoder == "v4l2" and self._coded and not self.frames:
+            # Video reached the decoder, and nothing came out.
+            self._decoder_failed("no frames from the decoder")
+            return
+        self._retry(f"no video within {CONNECT_TIMEOUT:.0f}s")
+
+    def _on_error(self, message: Gst.Message) -> None:
+        reason = message.parse_error()[0].message
+        if message.src is not None and message.src.get_name() in self._v4l2_branch:
+            self._decoder_failed(reason)
+        else:
+            self._retry(f"pipeline error: {reason}")
+
+    def _decoder_failed(self, reason: str) -> None:
+        if self.ladder.failed("v4l2"):
+            log.warning("%s: the H.265 hardware decoder failed (%s); using software from now on",
+                        self.camera.name, reason)
+        self._retry(f"H.265 hardware decoder: {reason}")
 
     def _on_negotiation_needed(self, webrtc: Gst.Element) -> None:
         webrtc.emit("create-offer", None, Gst.Promise.new_with_change_func(self._on_offer, None))
@@ -254,6 +332,7 @@ class CameraSession:
             return
         self._posted = True
         sdp = self._webrtc.get_property("local-description").sdp.as_text()
+        log.debug("%s: offer:\n%s", self.camera.name, sdp)
         gen = self._gen
 
         if self.camera.signalling == "websocket":
@@ -310,13 +389,15 @@ class CameraSession:
         self._webrtc.emit("add-ice-candidate", 0, candidate)
 
     def _apply_answer(self, text: str) -> None:
+        log.debug("%s: answer:\n%s", self.camera.name, text)
         result, sdp = GstSdp.SDPMessage.new_from_text(text)
         if result != GstSdp.SDPResult.OK:
             self._retry("the server's SDP answer did not parse")
             return
-        if "H264" not in text:
-            self._retry("the stream is not H.264 (in go2rtc use e.g. "
-                        "`ffmpeg:<stream>#video=h264`, or pick the _sub stream)")
+        self.codec = answer_codec(text)
+        if self.codec is None:
+            self._retry("the stream is neither H.265 nor H.264 (in go2rtc use e.g. "
+                        "`ffmpeg:<stream>#video=h264`)")
             return
         answer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.ANSWER, sdp)
         self._keep.append(answer)
@@ -325,6 +406,10 @@ class CameraSession:
         for candidate in self._early_candidates:
             self._webrtc.emit("add-ice-candidate", 0, candidate)
         self._early_candidates.clear()
+        # Before any media: the decoder negotiates (DMABuf or not) with
+        # waylandsink through the display's selector, which answers only on
+        # its active pad. The last status frame stays up until ours arrive.
+        self.display.attach(self._out)
 
     def _on_connection_state(self, webrtc: Gst.Element, _pspec: Any) -> None:
         state = webrtc.get_property("connection-state")
@@ -341,32 +426,80 @@ class CameraSession:
 
     # --- media -------------------------------------------------------------
 
+    # Runs on a webrtcbin streaming thread. Building and linking elements is
+    # fine there; anything touching session state goes through _on_main.
+
     def _on_pad_added(self, _webrtc: Gst.Element, pad: Gst.Pad) -> None:
         if pad.get_direction() != Gst.PadDirection.SRC:
             return
         pipe = self._pipeline
         if pipe is None:
             return
+        caps = pad.get_current_caps() or pad.query_caps(None)
+        encoding = str(_field(caps.get_structure(0), "encoding-name") or "").upper()
+        if encoding in ("H265", "HEVC"):
+            self._add_h265(pipe, pad)
+            return
+        self.decoder = "libav"      # the Pi 5 has no H.264 hardware: avdec_h264
         decode = Gst.ElementFactory.make("decodebin")
         decode.connect("pad-added", self._on_decoded_pad)
         pipe.add(decode)
         decode.sync_state_with_parent()
         pad.link(decode.get_static_pad("sink"))
 
+    def _add_h265(self, pipe: Gst.Pipeline, pad: Gst.Pad) -> None:
+        decoder = self.ladder.pick(self.camera.decoder)
+        names = ["rtph265depay", "h265parse", H265_DECODERS[decoder]]
+        elements = [Gst.ElementFactory.make(n) for n in names]
+        missing = [n for n, e in zip(names, elements) if e is None]
+        if missing:
+            reason = f"{', '.join(missing)} missing"
+            self._on_main(self._decoder_failed if decoder == "v4l2" else self._retry, reason)
+            return
+        self.decoder = decoder
+        if decoder == "v4l2":
+            # Keep the frames DMABufs: waylandsink hands them to the compositor,
+            # whose GPU reads the SAND tiles. Detiling on the CPU (videoconvert)
+            # costs more than decoding in software.
+            only_dmabuf = Gst.ElementFactory.make("capsfilter")
+            only_dmabuf.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:DMABuf)"))
+            elements.append(only_dmabuf)
+            self._v4l2_branch = {e.get_name() for e in elements} | {self._out.get_name()}
+            elements[2].get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._on_coded)
+        else:
+            elements += self._to_bgrx()
+        for element in elements:
+            pipe.add(element)
+            element.sync_state_with_parent()
+        for a, b in zip(elements, elements[1:] + [self._out]):
+            a.link(b)
+        pad.link(elements[0].get_static_pad("sink"))
+        log.info("%s: H.265, %s decoder", self.camera.name, decoder)
+
     def _on_decoded_pad(self, _decode: Gst.Element, pad: Gst.Pad) -> None:
         caps = pad.get_current_caps() or pad.query_caps(None)
         if not caps.to_string().startswith("video/"):
             return
         pipe = self._pipeline
-        convert = Gst.ElementFactory.make("videoconvert")
-        sink = Gst.ElementFactory.make("intervideosink")
-        sink.set_property("channel", self.channel)
-        for element in (convert, sink):
+        elements = self._to_bgrx()
+        for element in elements:
             pipe.add(element)
             element.sync_state_with_parent()
-        convert.link(sink)
-        pad.link(convert.get_static_pad("sink"))
-        sink.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._on_frame)
+        for a, b in zip(elements, elements[1:] + [self._out]):
+            a.link(b)
+        pad.link(elements[0].get_static_pad("sink"))
+
+    @staticmethod
+    def _to_bgrx() -> list[Gst.Element]:
+        """Software-decoded frames to what waylandsink's shm path takes."""
+        convert = Gst.ElementFactory.make("videoconvert")
+        bgrx = Gst.ElementFactory.make("capsfilter")
+        bgrx.set_property("caps", Gst.Caps.from_string("video/x-raw,format=BGRx"))
+        return [convert, bgrx]
+
+    def _on_coded(self, _pad: Gst.Pad, _info: Any) -> Gst.PadProbeReturn:
+        self._coded += 1
+        return Gst.PadProbeReturn.OK
 
     def _on_frame(self, pad: Gst.Pad, _info: Any) -> Gst.PadProbeReturn:
         self.frames += 1

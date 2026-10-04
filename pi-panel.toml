@@ -8,8 +8,10 @@ description = "Full-screen live camera feed over WebRTC (go2rtc / Frigate, or an
 # System Python on purpose: GStreamer's Python bindings (PyGObject and
 # gst-python) come from apt and must match the system GStreamer. The only
 # other dependency, pi-panel-varlink, is pure Python and found by path.
+# PYTHONFAULTHANDLER: a crash inside GStreamer logs every thread's Python
+# stack to the journal, so the call that crashed can be seen.
 exec = "/usr/bin/python3 -m pi_panel_webrtc --config ${config_dir}/config.toml"
-env = { PYTHONPATH = "${package_dir}/src:${package_dir}/../../pi-panel-core/pi-panel-core-ctl/packages/pi-panel-varlink/src" }
+env = { PYTHONFAULTHANDLER = "1", PYTHONPATH = "${package_dir}/src:${package_dir}/../../pi-panel-core/pi-panel-core-ctl/packages/pi-panel-varlink/src" }
 
 [config]
 templates = ["config.toml.example"]
@@ -19,9 +21,10 @@ packages = [
     "python3-gi",
     "python3-gst-1.0",             # gst-python overrides: without them promise replies crash
     "gir1.2-gst-plugins-bad-1.0",  # GstWebRTC / GstSdp typelibs (pulls in Gst, GstBase)
-    "gstreamer1.0-plugins-bad",    # webrtcbin, intervideo*, waylandsink
-    "gstreamer1.0-plugins-good",   # rtp depayloaders
-    "gstreamer1.0-libav",          # avdec_h264
+    "gstreamer1.0-plugins-bad",    # webrtcbin, proxysink/src, waylandsink, h265parse,
+                                   # v4l2slh265dec (the Pi 5's HEVC block: needs kernel >= 6.18)
+    "gstreamer1.0-plugins-good",   # rtph264depay, rtph265depay
+    "gstreamer1.0-libav",          # avdec_h264, avdec_h265
     "gstreamer1.0-nice",           # ICE for webrtcbin
 ]
 
